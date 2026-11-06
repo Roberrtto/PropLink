@@ -1,0 +1,23 @@
+# Python / backend
+.venv/
+__pycache__/
+*.pyc
+.env
+
+# Node / manager dashboard
+node_modules/
+dist/
+
+# React Native / Android (resident-app)
+resident-app/android/app/build/
+resident-app/android/build/
+resident-app/android/.gradle/
+resident-app/android/local.properties
+resident-app/.bundle/
+
+# Editors / OS
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db
