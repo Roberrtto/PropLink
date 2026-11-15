@@ -1,17 +1,16 @@
-# proplink_resident
+# PropLink Resident App
 
-A new Flutter project.
+Flutter app for residents: sign in, view bills, pay via M-Pesa, request services and maintenance.
 
-## Getting Started
+## Run
+1. Start the backend on port 8000 (see the root README).
+2. `flutter pub get`
+3. Android emulator: `flutter run` (the app reaches your PC at 10.0.2.2:8000).
+4. Real phone over USB:
+   adb reverse tcp:8000 tcp:8000
+   flutter run --dart-define=API_URL=http://localhost:8000
 
-This project is a starting point for a Flutter application.
-
-A few resources to get you started if this is your first Flutter project:
-
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+## Windows note
+If the project is on a different drive from the Pub cache (e.g. project on R:, cache on C:),
+`android/gradle.properties` must contain `kotlin.incremental=false`, or the Kotlin build fails with
+"Could not close incremental caches".
