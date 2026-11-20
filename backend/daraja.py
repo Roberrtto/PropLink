@@ -1,24 +1,31 @@
-"""Daraja (M-Pesa Express) client. MOCK=1 (default) fakes the STK push; set MOCK=0 + keys for real use."""
-import os, uuid, base64
-from datetime import datetime
+"""Sends SMS (login codes). SMS_PROVIDER=console prints to the log; africastalking sends real messages."""
+import logging
 import httpx
+import config
+import phone
 
-MOCK = os.getenv("DARAJA_MOCK", "1") == "1"
-BASE = os.getenv("DARAJA_BASE", "https://sandbox.safaricom.co.ke")
+log = logging.getLogger("proplink.sms")
 
-def stk_push(phone: str, amount: int, ref: str) -> str:
-    """Returns the CheckoutRequestID. Outcome arrives later on /api/mpesa/callback."""
-    if MOCK:
-        return "ws_CO_" + uuid.uuid4().hex[:16]
-    key, secret = os.environ["DARAJA_KEY"], os.environ["DARAJA_SECRET"]
-    shortcode, passkey = os.environ["DARAJA_SHORTCODE"], os.environ["DARAJA_PASSKEY"]
-    token = httpx.get(f"{BASE}/oauth/v1/generate?grant_type=client_credentials", auth=(key, secret)).json()["access_token"]
-    ts = datetime.now().strftime("%Y%m%d%H%M%S")
-    pwd = base64.b64encode(f"{shortcode}{passkey}{ts}".encode()).decode()
-    msisdn = "254" + phone.lstrip("0+").removeprefix("254")
-    r = httpx.post(f"{BASE}/mpesa/stkpush/v1/processrequest", headers={"Authorization": f"Bearer {token}"}, json={
-        "BusinessShortCode": shortcode, "Password": pwd, "Timestamp": ts, "TransactionType": "CustomerPayBillOnline",
-        "Amount": amount, "PartyA": msisdn, "PartyB": shortcode, "PhoneNumber": msisdn,
-        "CallBackURL": os.environ["DARAJA_CALLBACK_URL"], "AccountReference": ref, "TransactionDesc": ref})
-    r.raise_for_status()
-    return r.json()["CheckoutRequestID"]
+
+class SmsError(RuntimeError):
+    pass
+
+
+def send(msisdn: str, message: str) -> None:
+    if config.SMS_PROVIDER == "console":
+        log.warning("[SMS not sent: console mode] to %s: %s", phone.local(msisdn), message)
+        return
+    if config.SMS_PROVIDER != "africastalking":
+        raise SmsError(f"Unknown SMS_PROVIDER {config.SMS_PROVIDER!r}")
+    host = "api.sandbox.africastalking.com" if config.AT_USERNAME == "sandbox" else "api.africastalking.com"
+    data = {"username": config.AT_USERNAME, "to": phone.international(msisdn), "message": message}
+    if config.AT_SENDER_ID: data["from"] = config.AT_SENDER_ID
+    try:
+        r = httpx.post(f"https://{host}/version1/messaging", data=data, timeout=15,
+                       headers={"apiKey": config.AT_API_KEY, "Accept": "application/json"})
+        r.raise_for_status()
+        recipients = r.json().get("SMSMessageData", {}).get("Recipients", [])
+        if not recipients or recipients[0].get("status") != "Success":
+            raise SmsError(f"SMS rejected: {recipients[0].get('status') if recipients else r.text[:200]}")
+    except httpx.HTTPError as e:
+        raise SmsError(f"SMS gateway error: {e}") from e

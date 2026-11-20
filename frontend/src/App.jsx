@@ -1,14 +1,26 @@
 import { useState, useEffect, useCallback } from "react";
 
-const api = (path, method = "GET", body) =>
-  fetch("/api" + path, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined })
-    .then(async (r) => { if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText); return r.json(); });
+// The sign-in token lives only for this browser tab (sessionStorage) and is sent with every request.
+const TOKEN_KEY = "proplink_token";
+const getToken = () => { try { return sessionStorage.getItem(TOKEN_KEY); } catch { return null; } };
+const setToken = (t) => { try { t ? sessionStorage.setItem(TOKEN_KEY, t) : sessionStorage.removeItem(TOKEN_KEY); } catch { /* storage blocked */ } };
+const api = (path, method = "GET", body) => {
+  const headers = { "Content-Type": "application/json" };
+  const t = getToken(); if (t) headers.Authorization = "Bearer " + t;
+  return fetch("/api" + path, { method, headers, body: body ? JSON.stringify(body) : undefined })
+    .then(async (r) => {
+      const data = await r.json().catch(() => ({}));
+      if (r.status === 401 && t) { setToken(null); window.dispatchEvent(new Event("proplink-signed-out")); }
+      if (!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : r.status === 422 ? "Please check the values you entered" : r.statusText);
+      return data;
+    });
+};
 const kes = (n) => "KES " + Number(n || 0).toLocaleString();
 const pretty = (s) => (s ? new Date(s).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "");
 
 function useLoad(path) {
   const [data, setData] = useState(null);
-  const load = useCallback(() => api(path).then(setData).catch(() => setData(null)), [path]);
+  const load = useCallback(() => (path ? api(path).then(setData).catch(() => setData(null)) : Promise.resolve()), [path]);
   useEffect(() => { load(); }, [load]);
   return [data, load];
 }
@@ -66,7 +78,7 @@ function Units({ pid, toast }) {
       { h: "Resident", f: (u) => u.resident || "—" }, { h: "", f: (u) => u.tenancy_id && <button className="btn sm red" onClick={run(() => api(`/tenancies/${u.tenancy_id}/end`, "POST"), "Tenancy ended")}>End tenancy</button> }]} /></Card>
     <Card title="Add a unit"><Form label="Add unit" fields={[{ k: "building", p: "Block (e.g. B)" }, { k: "number", p: "Unit number" }, { k: "rent", p: "Monthly rent", t: "number" }]}
       submit={run((v) => api("/units", "POST", { ...v, rent: +v.rent, property_id: pid }), "Unit added")} /></Card>
-    <Card title="Assign a resident to a vacant unit"><Form label="Assign" fields={[{ k: "unit_id", p: "Vacant unit", options: vacant }, { k: "full_name", p: "Full name" }, { k: "phone", p: "Phone (07…)" }]}
+    <Card title="Assign a resident to a vacant unit"><Form label="Assign" fields={[{ k: "unit_id", p: "Vacant unit", options: vacant }, { k: "full_name", p: "Full name" }, { k: "phone", p: "Phone (0712 345 678)", t: "tel" }]}
       submit={run((v) => api("/tenancies", "POST", { ...v, unit_id: +v.unit_id }), "Resident assigned")} /></Card>
     <Card title="Record a water meter reading"><Form label="Save reading" fields={[{ k: "unit_id", p: "Unit", options: all }, { k: "value", p: "Meter value", t: "number" }]}
       submit={run((v) => api("/meter-readings", "POST", { unit_id: +v.unit_id, value: +v.value }), "Reading saved")} /></Card>
@@ -88,13 +100,13 @@ function Billing({ pid, toast }) {
   </>);
 }
 
-function Payments({ pid, toast }) {
+function Payments({ pid, toast, simulated }) {
   const [rows, load] = useLoad(`/payments?pid=${pid}`);
   const sim = (id, o) => async () => { try { await api(`/mock/daraja/${id}/${o}`, "POST"); toast(o === "success" ? "Payment confirmed" : "Payment failed"); load(); } catch (e) { toast(e.message); } };
   return (<Card title="Payment requests and confirmed transactions">
     <Table rows={rows} cols={[{ h: "Unit", f: (r) => r.unit }, { h: "Resident", f: (r) => r.resident }, { h: "Charge", f: (r) => `${r.charge} ${r.period}` }, { h: "Amount", f: (r) => r.amount.toLocaleString() }, { h: "Phone", f: (r) => r.phone },
       { h: "Status", f: (r) => <Pill v={r.status} /> }, { h: "M-Pesa receipt", f: (r) => r.mpesa_receipt || "—" }, { h: "System receipt", f: (r) => r.receipt || "—" }, { h: "Sent", f: (r) => pretty(r.created_at) },
-      { h: "Daraja simulator", f: (r) => r.status === "pending" && <><button className="btn sm" onClick={sim(r.checkout_request_id, "success")}>Confirm</button> <button className="btn sm red" onClick={sim(r.checkout_request_id, "fail")}>Fail</button></> }]} empty="No payment requests yet. Request one from Billing." />
+      ...(simulated ? [{ h: "Daraja simulator", f: (r) => r.status === "pending" && <><button className="btn sm" onClick={sim(r.checkout_request_id, "success")}>Confirm</button> <button className="btn sm red" onClick={sim(r.checkout_request_id, "fail")}>Fail</button></> }] : [])]} empty="No payment requests yet. Request one from Billing." />
   </Card>);
 }
 
@@ -119,7 +131,7 @@ function Providers({ toast }) {
   return (<>
     <Card title="Service providers"><Table rows={rows} cols={[{ h: "Name", f: (p) => p.name }, { h: "Category", f: (p) => p.category }, { h: "Phone", f: (p) => p.phone }, { h: "Approved", f: (p) => <Pill v={p.approved ? "paid" : "failed"}>{p.approved ? "Approved" : "Suspended"}</Pill> },
       { h: "", f: (p) => <button className="btn sm ghost" onClick={async () => { await api(`/providers/${p.id}/toggle`, "POST"); load(); }}>{p.approved ? "Suspend" : "Approve"}</button> }]} /></Card>
-    <Card title="Add a provider"><Form label="Add provider" fields={[{ k: "name", p: "Business name" }, { k: "category", p: "Category" }, { k: "phone", p: "Phone" }]} submit={async (v) => { await api("/providers", "POST", v); toast("Provider added"); load(); }} /></Card>
+    <Card title="Add a provider"><Form label="Add provider" fields={[{ k: "name", p: "Business name" }, { k: "category", p: "Category" }, { k: "phone", p: "Phone (0712 345 678)", t: "tel" }]} submit={async (v) => { try { await api("/providers", "POST", v); toast("Provider added"); load(); } catch (e) { toast(e.message); } }} /></Card>
   </>);
 }
 
@@ -150,17 +162,83 @@ function Automation({ toast }) {
   </>);
 }
 
+
+function Staff({ toast, me }) {
+  const [rows, load] = useLoad(me.role === "admin" ? "/staff" : null);
+  const run = (fn, msg) => async (...a) => { try { await fn(...a); toast(msg); load(); } catch (e) { toast(e.message); } };
+  return (<>
+    <Card title="Change your password"><Form label="Change password" fields={[{ k: "current_password", p: "Current password", t: "password" }, { k: "new_password", p: "New password (10+ chars, Aa1)", t: "password" }]}
+      submit={run(async (v) => { const r = await api("/staff/me/password", "POST", v); setToken(r.token); }, "Password changed. Other devices have been signed out.")} /></Card>
+    {me.role === "admin" && <>
+      <Card title="Dashboard accounts"><Table rows={rows} cols={[{ h: "Name", f: (s) => s.full_name }, { h: "Email", f: (s) => s.email }, { h: "Role", f: (s) => s.role },
+        { h: "Status", f: (s) => <Pill v={s.active ? "paid" : "failed"}>{s.active ? "Active" : "Disabled"}</Pill> }, { h: "Last sign-in", f: (s) => pretty(s.last_login) || "Never" },
+        { h: "", f: (s) => s.id !== me.id && <button className="btn sm ghost" onClick={run(() => api(`/staff/${s.id}`, "PATCH", { active: !s.active }), "Account updated")}>{s.active ? "Disable" : "Enable"}</button> }]} /></Card>
+      <Card title="Add a dashboard account"><Form label="Create account" fields={[{ k: "full_name", p: "Full name" }, { k: "email", p: "Email", t: "email" }, { k: "role", p: "Role", options: [{ v: "manager", l: "Manager" }, { v: "admin", l: "Admin (can manage accounts)" }] }, { k: "password", p: "Temporary password (10+ chars, Aa1)", t: "password" }]}
+        submit={run((v) => api("/staff", "POST", v), "Account created. Share the temporary password privately.")} /></Card>
+    </>}
+  </>);
+}
+
+function Login({ onDone }) {
+  const [v, setV] = useState({ email: "", password: "" }); const [err, setErr] = useState(""); const [busy, setBusy] = useState(false);
+  const submit = async (e) => {
+    e.preventDefault(); setBusy(true); setErr("");
+    try { const r = await api("/staff/login", "POST", v); setToken(r.token); onDone(r.user); } catch (e2) { setErr(e2.message); }
+    setBusy(false);
+  };
+  return (
+    <div className="main" style={{ maxWidth: 380, margin: "10vh auto" }}>
+      <Card title="Sign in to PropLink">
+        <form onSubmit={submit} style={{ display: "grid", gap: 10 }}>
+          <input type="email" autoComplete="username" required placeholder="Email" value={v.email} onChange={(e) => setV({ ...v, email: e.target.value })} />
+          <input type="password" autoComplete="current-password" required placeholder="Password" value={v.password} onChange={(e) => setV({ ...v, password: e.target.value })} />
+          {err && <div style={{ color: "#b42323" }}>{err}</div>}
+          <button className="btn" disabled={busy}>{busy ? "Signing in…" : "Sign in"}</button>
+        </form>
+      </Card>
+    </div>
+  );
+}
+
+function FirstProperty({ me, onCreated, toast }) {
+  if (me.role !== "admin") return <div className="main"><div className="empty">No property has been set up yet. Ask an admin to create one.</div></div>;
+  return (
+    <div className="main" style={{ maxWidth: 560, margin: "8vh auto" }}>
+      <Card title="Create your first property">
+        <Form label="Create property" fields={[{ k: "name", p: "Property name (e.g. Riverside Court)" }, { k: "address", p: "Address (e.g. Ngong Road, Nairobi)" }]}
+          submit={async (v) => { try { await api("/properties", "POST", v); onCreated(); } catch (e) { toast(e.message); } }} />
+      </Card>
+    </div>
+  );
+}
+
 /* ---------------- Shell ---------------- */
-const NAV = ["Overview", "Properties and units", "Billing", "Payments", "Maintenance", "Providers", "Reports", "Automation rules"];
+const NAV = ["Overview", "Properties and units", "Billing", "Payments", "Maintenance", "Providers", "Reports", "Automation rules", "Staff"];
 export default function App() {
-  const [page, setPage] = useState("Overview"); const [props] = useLoad("/properties"); const [msg, setMsg] = useState(""); const [tick, setTick] = useState(0); const [period, setPeriod] = useState(new Date().toISOString().slice(0, 7));
+  const [me, setMe] = useState(null); const [checked, setChecked] = useState(false);
+  useEffect(() => {
+    const out = () => setMe(null); window.addEventListener("proplink-signed-out", out);
+    if (getToken()) api("/staff/me").then(setMe).catch(() => {}).finally(() => setChecked(true)); else setChecked(true);
+    return () => window.removeEventListener("proplink-signed-out", out);
+  }, []);
+  if (!checked) return <div className="main"><div className="empty">Loading…</div></div>;
+  if (!me) return <Login onDone={setMe} />;
+  return <Dashboard me={me} signOut={async () => { await api("/staff/logout", "POST").catch(() => {}); setToken(null); setMe(null); }} />;
+}
+
+function Dashboard({ me, signOut }) {
+  const [page, setPage] = useState("Overview"); const [props, loadProps] = useLoad("/properties"); const [cfg] = useLoad("/config"); const [msg, setMsg] = useState(""); const [tick, setTick] = useState(0); const [period, setPeriod] = useState(new Date().toISOString().slice(0, 7));
   const toast = (m) => { setMsg(m); setTimeout(() => setMsg(""), 3500); setTick((t) => t + 1); };
-  const prop = props && props[0]; if (!prop) return <div className="main"><div className="empty">Connecting to the PropLink API… (is the backend running on port 8000?)</div></div>;
-  const pid = prop.id; const P = { pid, toast };
-  const body = { Overview: <Overview {...P} />, "Properties and units": <Units {...P} />, Billing: <Billing {...P} />, Payments: <Payments {...P} />, Maintenance: <Maintenance {...P} />, Providers: <Providers {...P} />, Reports: <Reports {...P} />, "Automation rules": <Automation {...P} /> }[page];
+  if (!props) return <div className="main"><div className="empty">Connecting to the PropLink API… (is the backend running on port 8000?)</div></div>;
+  const prop = props[0]; if (!prop) return <><FirstProperty me={me} onCreated={loadProps} toast={toast} />{msg && <div className="toast">{msg}</div>}</>;
+  const pid = prop.id; const P = { pid, toast, me, simulated: cfg?.payments_simulated };
+  const body = { Overview: <Overview {...P} />, "Properties and units": <Units {...P} />, Billing: <Billing {...P} />, Payments: <Payments {...P} />, Maintenance: <Maintenance {...P} />, Providers: <Providers {...P} />, Reports: <Reports {...P} />, "Automation rules": <Automation {...P} />, Staff: <Staff {...P} /> }[page];
   return (
     <div className="app">
-      <nav className="side"><h1>PropLink</h1>{NAV.map((n) => <button key={n} className={n === page ? "on" : ""} onClick={() => setPage(n)}>{n}</button>)}</nav>
+      <nav className="side"><h1>PropLink</h1>{NAV.map((n) => <button key={n} className={n === page ? "on" : ""} onClick={() => setPage(n)}>{n}</button>)}
+        <div style={{ marginTop: 24, fontSize: 13, opacity: 0.85 }}>{me.full_name}<br /><small>{me.email} · {me.role}</small></div>
+        <button onClick={signOut}>Sign out</button>
+        {cfg?.payments_simulated && <div style={{ marginTop: 12, fontSize: 12, opacity: 0.75 }}>Test mode: M-Pesa is simulated</div>}</nav>
       <main className="main">
         <div className="head"><div><small>{prop.name}</small><h2>{page}</h2></div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
