@@ -1,18 +1,18 @@
-"""Admin commands.
+"""Admin commands (run by whoever operates the PropLink server).
 
-  python manage.py gen-secrets          print new random secrets to paste into .env
-  python manage.py create-admin         create a dashboard admin (asks for email, name and password)
-  python manage.py reset-password EMAIL set a new password for a dashboard account and unlock it
-  python manage.py run-automation       run the automation rules once (for a scheduled task)
+  python manage.py gen-secrets            print new random secrets to paste into .env
+  python manage.py create-organization    add a landlord (a customer): their company and its first landlord login
+  python manage.py reset-password EMAIL   set a new password for a dashboard account and unlock it
+  python manage.py run-automation         run every organization's automation rules once (for a scheduled task)
 
-In Docker:  docker compose exec backend python manage.py create-admin
+In Docker:  docker compose exec backend python manage.py create-organization
 """
 import base64, getpass, os, secrets, sys
 
 
 def gen_secrets():
     print("# Paste these into .env. Keep them secret and backed up: losing FIELD_ENCRYPTION_KEY")
-    print("# or BLIND_INDEX_KEY makes stored phone numbers and names unreadable.")
+    print("# or BLIND_INDEX_KEY makes stored names, IDs, phone numbers and payment details unreadable.")
     print(f"JWT_SECRET={secrets.token_urlsafe(48)}")
     print(f"FIELD_ENCRYPTION_KEY={base64.urlsafe_b64encode(os.urandom(32)).decode()}")
     print(f"BLIND_INDEX_KEY={secrets.token_urlsafe(48)}")
@@ -29,17 +29,23 @@ def ask_password():
         return pw
 
 
-def create_admin():
+def create_organization():
     from sqlalchemy import select
-    from models import Base, Session, StaffUser, engine
+    from models import Base, Session, StaffUser, Organization, engine, new_rules
     from security import hash_password
     Base.metadata.create_all(engine)
-    email = input("Email: ").strip().lower(); name = input("Full name: ").strip()
-    if "@" not in email or not name: sys.exit("Email and name are required")
+    org = input("Landlord or company name: ").strip()
+    email = input("Landlord's email (their dashboard login): ").strip().lower()
+    name = input("Landlord's full name: ").strip()
+    if not org or "@" not in email or not name: sys.exit("Company name, a valid email and a name are required")
     with Session() as db:
         if db.scalar(select(StaffUser).where(StaffUser.email == email)): sys.exit("That email already has an account")
-        db.add(StaffUser(email=email, full_name=name, role="admin", password_hash=hash_password(ask_password()))); db.commit()
-    print(f"Admin {email} created. Sign in to the dashboard with this email and password.")
+        pw = ask_password()
+        o = Organization(name=org); db.add(o); db.flush(); db.add_all(new_rules(o.id))
+        db.add(StaffUser(org_id=o.id, email=email, full_name=name, role="landlord", password_hash=hash_password(pw)))
+        db.commit()
+    print(f"Created '{org}' with landlord {email}. They sign in to the dashboard, add their properties and managers,")
+    print("and enter their own M-Pesa details under Payment settings.")
 
 
 def reset_password(email):
@@ -65,7 +71,7 @@ def run_automation():
 if __name__ == "__main__":
     cmd, args = (sys.argv[1] if len(sys.argv) > 1 else ""), sys.argv[2:]
     if cmd == "gen-secrets": gen_secrets()
-    elif cmd == "create-admin": create_admin()
+    elif cmd == "create-organization": create_organization()
     elif cmd == "reset-password" and args: reset_password(args[0])
     elif cmd == "run-automation": run_automation()
     else: print(__doc__)

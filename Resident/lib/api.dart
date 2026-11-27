@@ -9,7 +9,7 @@ import 'package:http/http.dart' as http;
 //   Phone over USB:      adb reverse tcp:8000 tcp:8000
 //                        flutter run --dart-define=API_URL=http://localhost:8000
 //   Real users:          flutter build apk --release --dart-define=API_URL=https://your-domain
-// Release builds refuse plain http:// so sign-in codes and tokens are always encrypted in transit.
+// Release builds refuse plain http:// so sign-in details and tokens are always encrypted in transit.
 const String kBaseUrl = String.fromEnvironment('API_URL', defaultValue: 'http://10.0.2.2:8000');
 const _tokenKey = 'proplink_token';
 const _timeout = Duration(seconds: 20);
@@ -69,11 +69,13 @@ class Api {
     };
     try {
       final http.Response r = await (method == 'POST'
-              ? http.post(uri, headers: headers, body: body == null ? null : jsonEncode(body))
-              : http.get(uri, headers: headers))
+          ? http.post(uri, headers: headers, body: body == null ? null : jsonEncode(body))
+          : http.get(uri, headers: headers))
           .timeout(_timeout);
       final dynamic data = r.body.isEmpty ? null : jsonDecode(r.body);
-      if (r.statusCode == 401) {
+      // A 401 from the sign-in screens means "details incorrect", not "your session expired",
+      // so those keep the server's message instead of being replaced.
+      if (r.statusCode == 401 && !path.startsWith('/auth/')) {
         await saveToken(null);
         throw ApiException('Please sign in again');
       }
@@ -82,8 +84,8 @@ class Api {
         throw ApiException(detail is String
             ? detail
             : r.statusCode == 422
-                ? 'Please check what you entered'
-                : 'Request failed');
+            ? 'Please check what you entered'
+            : 'Request failed');
       }
       return data;
     } on ApiException {
