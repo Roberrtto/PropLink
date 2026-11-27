@@ -37,8 +37,7 @@ class PropLinkApp extends StatelessWidget {
     ),
     home: ValueListenableBuilder<bool>(
       valueListenable: Api.authed,
-      builder: (_, ok,
-          _) => ok ? const Shell() : const LoginPage(),
+      builder: (_, ok, _) => ok ? const Shell() : const LoginPage(),
     ),
   );
 }
@@ -192,10 +191,23 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
-  final phone = TextEditingController();
+  final fullName = TextEditingController();
+  final idNumber = TextEditingController();
   final code = TextEditingController();
-  bool sent = false, busy = false;
-  String? err, dev;
+  final password = TextEditingController();
+
+  int step = 0; // 0 = verify identity, 1 = activate with manager code, 2 = sign in with password
+  bool busy = false;
+  String? err;
+
+  @override
+  void dispose() {
+    fullName.dispose();
+    idNumber.dispose();
+    code.dispose();
+    password.dispose();
+    super.dispose();
+  }
 
   Future<void> run(Future<void> Function() f) async {
     setState(() { busy = true; err = null; });
@@ -207,14 +219,30 @@ class _LoginPageState extends State<LoginPage> {
     if (mounted) setState(() => busy = false);
   }
 
-  Future<void> send() => run(() async {
-    final r = await Api.post('/auth/request-otp', {'phone': phone.text});
-    dev = r['dev_code'] as String?;
-    sent = true;
+  Future<void> verifyIdentity() => run(() async {
+    final r = await Api.post('/auth/verify-identity', {
+      'full_name': fullName.text.trim(),
+      'id_number': idNumber.text.trim(),
+    });
+    step = (r['has_password'] == true) ? 2 : 1;
   });
 
-  Future<void> verify() => run(() async {
-    final r = await Api.post('/auth/verify', {'phone': phone.text, 'code': code.text});
+  Future<void> activate() => run(() async {
+    final r = await Api.post('/auth/activate', {
+      'full_name': fullName.text.trim(),
+      'id_number': idNumber.text.trim(),
+      'code': code.text.trim(),
+      'password': password.text,
+    });
+    await Api.saveToken(r['token'] as String);
+  });
+
+  Future<void> login() => run(() async {
+    final r = await Api.post('/auth/login', {
+      'full_name': fullName.text.trim(),
+      'id_number': idNumber.text.trim(),
+      'password': password.text,
+    });
     await Api.saveToken(r['token'] as String);
   });
 
@@ -227,17 +255,70 @@ class _LoginPageState extends State<LoginPage> {
           child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
             const Text('PropLink', style: TextStyle(fontSize: 32, fontWeight: FontWeight.w800, color: ink)),
             const SizedBox(height: 4),
-            const Text('Sign in with your phone number', style: TextStyle(color: muted)),
+            Text(
+              step == 0
+                  ? 'Enter your registered details to continue'
+                  : step == 1
+                  ? 'Enter the 6-digit code from your property manager and set a password'
+                  : 'Enter your password to sign in',
+              style: const TextStyle(color: muted),
+            ),
             const SizedBox(height: 24),
-            TextField(controller: phone, enabled: !sent, keyboardType: TextInputType.phone, decoration: const InputDecoration(labelText: 'Phone (07...)', border: OutlineInputBorder(), filled: true, fillColor: Colors.white)),
-            if (sent) ...[
+            TextField(
+              controller: fullName,
+              enabled: step == 0,
+              decoration: const InputDecoration(labelText: 'Full name', border: OutlineInputBorder(), filled: true, fillColor: Colors.white),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: idNumber,
+              enabled: step == 0,
+              decoration: const InputDecoration(labelText: 'National ID or Passport number', border: OutlineInputBorder(), filled: true, fillColor: Colors.white),
+            ),
+            if (step == 1) ...[
               const SizedBox(height: 12),
-              TextField(controller: code, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: '6-digit code', border: OutlineInputBorder(), filled: true, fillColor: Colors.white)),
-              if (dev != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text('Demo mode: your code is $dev (no SMS is sent yet)', style: const TextStyle(color: muted))),
+              TextField(
+                controller: code,
+                keyboardType: TextInputType.number,
+                maxLength: 6,
+                decoration: const InputDecoration(labelText: '6-digit activation code', border: OutlineInputBorder(), filled: true, fillColor: Colors.white),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: password,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: 'Create password (10+ chars, Aa1)', border: OutlineInputBorder(), filled: true, fillColor: Colors.white),
+              ),
+            ],
+            if (step == 2) ...[
+              const SizedBox(height: 12),
+              TextField(
+                controller: password,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: 'Password', border: OutlineInputBorder(), filled: true, fillColor: Colors.white),
+              ),
             ],
             if (err != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text(err!, style: const TextStyle(color: Color(0xFFB42323)))),
             const SizedBox(height: 16),
-            FilledButton(onPressed: busy ? null : (sent ? verify : send), child: Padding(padding: const EdgeInsets.all(6), child: Text(sent ? 'Verify and sign in' : 'Send code'))),
+            FilledButton(
+              onPressed: busy ? null : (step == 0 ? verifyIdentity : step == 1 ? activate : login),
+              child: Padding(
+                padding: const EdgeInsets.all(6),
+                child: Text(step == 0 ? 'Continue' : step == 1 ? 'Activate & sign in' : 'Sign in'),
+              ),
+            ),
+            if (step > 0) ...[
+              const SizedBox(height: 8),
+              TextButton(
+                onPressed: busy ? null : () => setState(() { step = 0; code.clear(); password.clear(); err = null; }),
+                child: const Text('Use different details'),
+              ),
+              if (step == 2)
+                TextButton(
+                  onPressed: busy ? null : () => setState(() { step = 1; password.clear(); err = null; }),
+                  child: const Text('Forgot password? Activate with a manager code'),
+                ),
+            ],
           ]),
         ),
       ),
@@ -578,7 +659,7 @@ class AccountPage extends StatelessWidget {
         if (notes.isEmpty) const Text('Nothing new.', style: TextStyle(color: muted)),
         for (final n in notes) Panel(child: Text('${n['message']}')),
         const SizedBox(height: 12),
-        OutlinedButton(onPressed: () => Api.saveToken(null), child: const Text('Sign out')),
+        OutlinedButton(onPressed: () => Api.signOut(), child: const Text('Sign out')),
       ]);
     },
   );
