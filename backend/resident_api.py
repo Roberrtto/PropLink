@@ -1,70 +1,85 @@
-"""Resident (mobile) API: phone + one-time-code login, and endpoints scoped to the signed-in resident's own tenancy."""
-import hmac, logging, secrets
+"""Resident (mobile) API.
+
+Sign-in flow:
+  1. /auth/verify-identity  name + ID/passport must match a registered resident with an active tenancy.
+  2. First time (or forgotten password): the property manager issues a 2-minute code in the dashboard;
+     /auth/activate checks it and sets the resident's password.
+  3. Later: /auth/login with name + ID + password. No code needed.
+All other endpoints are scoped to the signed-in resident's own tenancy.
+"""
+import hmac, logging
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
-import config, daraja, sms, phone as ph
-from crypto import blind_index, hash_secret
+from sqlalchemy import select
+import config, daraja, phone as ph
+from crypto import hash_secret, id_index, norm_name
 from models import (get_db, row, audit, UserAccount, Tenancy, Unit, Building, Property, Bill, PaymentRequest, MpesaTransaction,
                     Payment, Receipt, ServiceRequest, ServiceProvider, Notification, OtpCode)
-from security import current_tenancy, make_token, rate_limit, client_ip
-from main import stk, simulate, normalize_phone
+from security import current_tenancy, make_token, rate_limit, client_ip, hash_password, check_password, burn_time, password_problem
+from main import stk, simulate
 
 log = logging.getLogger("proplink.resident")
 router = APIRouter(prefix="/api")
-GENERIC = "If this number belongs to a resident, a code has been sent by SMS."
+BAD = "The details provided are incorrect"
+BAD_CODE = "Wrong or expired code. Ask your property manager for a new one."
 
 
-def active_resident(db, msisdn):
-    for u in db.scalars(select(UserAccount).where(UserAccount.phone_hash == blind_index(msisdn))):
-        if db.scalar(select(Tenancy).where(Tenancy.resident_id == u.id, Tenancy.end_date.is_(None))): return u
+class IdentityIn(BaseModel):
+    full_name: str = Field(min_length=1, max_length=100)
+    id_number: str = Field(min_length=5, max_length=20)
+class LoginIn(IdentityIn): password: str = Field(max_length=200)
+class ActivateIn(IdentityIn):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    password: str = Field(max_length=200)
+
+
+def find_resident(db, d):
+    """The resident whose ID and name match and who still has an active tenancy, else None."""
+    for u in db.scalars(select(UserAccount).where(UserAccount.id_hash == id_index(d.id_number))):
+        if norm_name(u.full_name) == norm_name(d.full_name) and \
+           db.scalar(select(Tenancy).where(Tenancy.resident_id == u.id, Tenancy.end_date.is_(None))):
+            return u
     return None
 
 
-class PhoneIn(BaseModel): phone: str = Field(max_length=20)
-class VerifyIn(BaseModel): phone: str = Field(max_length=20); code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+@router.post("/auth/verify-identity")  # screen 1
+def verify_identity(d: IdentityIn, request: Request, db=Depends(get_db)):
+    rate_limit("ident-ip", client_ip(request), 20, 600); rate_limit("ident-id", id_index(d.id_number), 8, 600)
+    u = find_resident(db, d)
+    if not u: raise HTTPException(400, BAD)
+    return {"has_password": bool(u.password_hash)}
 
 
-@router.post("/auth/request-otp")
-def request_otp(d: PhoneIn, request: Request, db=Depends(get_db)):
-    msisdn = normalize_phone(d.phone); h = blind_index(msisdn)
-    rate_limit("otp-ip", client_ip(request), 10, 3600); rate_limit("otp-phone", h, 3, 600)
-    last = db.scalar(select(OtpCode).where(OtpCode.phone_hash == h).order_by(OtpCode.id.desc()))
-    if last and last.created_at > datetime.now() - timedelta(seconds=config.OTP_RESEND_SECONDS):
-        raise HTTPException(429, "A code was just sent. Wait a minute before asking for another.")
-    resident = active_resident(db, msisdn)
-    if not resident:  # same answer either way, so nobody can test which numbers are registered
-        log.info("Login code requested for an unregistered number"); return {"sent": True, "message": GENERIC}
-    code = f"{secrets.randbelow(1_000_000):06d}"
-    db.execute(delete(OtpCode).where(OtpCode.phone_hash == h))
-    db.add(OtpCode(phone_hash=h, code_hash=hash_secret(code), expires_at=datetime.now() + timedelta(seconds=config.OTP_TTL_SECONDS)))
-    try:
-        sms.send(msisdn, f"Your PropLink code is {code}. It expires in {config.OTP_TTL_SECONDS // 60} minutes. Never share it with anyone.")
-    except sms.SmsError as e:
-        log.error("Login code not sent: %s", e); db.rollback()
-        raise HTTPException(502, "We couldn't send the SMS right now. Please try again shortly.")
-    db.commit()
-    out = {"sent": True, "message": GENERIC}
-    if config.SMS_PROVIDER == "console" and not config.PRODUCTION: out["dev_code"] = code  # local testing only
-    return out
-
-
-@router.post("/auth/verify")
-def verify_otp(d: VerifyIn, request: Request, db=Depends(get_db)):
-    rate_limit("verify-ip", client_ip(request), 30, 600)
-    msisdn = normalize_phone(d.phone); h = blind_index(msisdn)
-    otp = db.scalar(select(OtpCode).where(OtpCode.phone_hash == h).order_by(OtpCode.id.desc()))
-    if not otp or otp.expires_at < datetime.now(): raise HTTPException(400, "Wrong or expired code")
+@router.post("/auth/activate")  # screen 2: first-time activation or forgotten password, using the manager's code
+def activate(d: ActivateIn, request: Request, db=Depends(get_db)):
+    rate_limit("act-ip", client_ip(request), 30, 600); rate_limit("act-id", id_index(d.id_number), 10, 600)
+    if err := password_problem(d.password): raise HTTPException(400, err)
+    u = find_resident(db, d)
+    if not u: raise HTTPException(400, BAD)
+    otp = db.scalar(select(OtpCode).where(OtpCode.user_id == u.id).order_by(OtpCode.id.desc()))
+    if not otp or otp.expires_at < datetime.now(): raise HTTPException(400, BAD_CODE)
     otp.attempts += 1
     if otp.attempts > config.OTP_MAX_ATTEMPTS:
-        db.delete(otp); db.commit(); raise HTTPException(400, "Too many wrong codes. Request a new code.")
+        db.delete(otp); db.commit(); raise HTTPException(400, "Too many wrong codes. Ask your property manager for a new one.")
     if not hmac.compare_digest(otp.code_hash, hash_secret(d.code)):
-        db.commit(); raise HTTPException(400, "Wrong or expired code")
+        db.commit(); raise HTTPException(400, BAD_CODE)
     db.delete(otp)
-    u = active_resident(db, msisdn)
-    if not u: db.commit(); raise HTTPException(400, "Wrong or expired code")
-    audit(db, "resident signed in", "user_account", u.id, actor=f"resident #{u.id}"); db.commit()
+    u.password_hash = hash_password(d.password); u.token_version += 1  # signs out any other device
+    audit(db, "resident activated account", "user_account", u.id, actor=f"resident #{u.id}", org=u.org_id); db.commit()
+    return {"token": make_token("resident", u.id, u.token_version, timedelta(days=config.RESIDENT_TOKEN_DAYS)), "name": u.full_name}
+
+
+@router.post("/auth/login")
+def login(d: LoginIn, request: Request, db=Depends(get_db)):
+    rate_limit("rlogin-ip", client_ip(request), 30, 900); rate_limit("rlogin-id", id_index(d.id_number), 8, 900)
+    u = find_resident(db, d)
+    if not u or not u.password_hash:
+        burn_time(d.password); raise HTTPException(401, BAD)  # same answer and timing as a wrong password
+    if not check_password(u.password_hash, d.password):
+        audit(db, "failed resident sign-in", "user_account", u.id, actor=f"resident #{u.id}", org=u.org_id); db.commit()
+        raise HTTPException(401, BAD)
+    audit(db, "resident signed in", "user_account", u.id, actor=f"resident #{u.id}", org=u.org_id); db.commit()
     return {"token": make_token("resident", u.id, u.token_version, timedelta(days=config.RESIDENT_TOKEN_DAYS)), "name": u.full_name}
 
 

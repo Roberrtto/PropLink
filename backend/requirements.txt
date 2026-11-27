@@ -3,3 +3,8 @@ uvicorn[standard]
 sqlalchemy>=2.0
 psycopg2-binary
 httpx
+pydantic>=2
+pyjwt
+argon2-cffi
+cryptography
+python-dotenv

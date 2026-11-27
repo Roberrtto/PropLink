@@ -27,7 +27,7 @@ def check_password(stored: str, pw: str) -> bool:
         return False
 
 
-_DUMMY_HASH = _ph.hash("timing-equaliser")  # so unknown emails take as long as wrong passwords
+_DUMMY_HASH = _ph.hash("timing-equaliser")  # so unknown accounts take as long as wrong passwords
 
 
 def burn_time(pw: str) -> None:
@@ -64,8 +64,9 @@ _hits_lock = threading.Lock()
 
 
 def rate_limit(bucket: str, key: str, limit: int, window_s: int) -> None:
-    now = time.monotonic(); q = _hits[(bucket, key)]
+    now = time.monotonic()
     with _hits_lock:
+        q = _hits[(bucket, key)]
         while q and q[0] <= now - window_s: q.popleft()
         if len(q) >= limit:
             raise HTTPException(429, "Too many attempts. Please wait a few minutes and try again.")
@@ -73,6 +74,7 @@ def rate_limit(bucket: str, key: str, limit: int, window_s: int) -> None:
 
 
 def client_ip(request: Request) -> str:
+    # Behind a reverse proxy, start uvicorn with --proxy-headers so this is the real visitor, not the proxy.
     return request.client.host if request.client else "unknown"
 
 
@@ -83,15 +85,18 @@ def current_staff(authorization: str = Header(""), db=Depends(get_db)) -> StaffU
     if not s or not s.active or s.token_version != data.get("ver"):
         raise HTTPException(401, "Please sign in again")
     db.info["actor"] = s.email
+    db.info["actor_id"] = s.id
+    db.info["org"] = s.org_id
     return s
 
 
-def require_admin(s: StaffUser = Depends(current_staff)) -> StaffUser:
-    if s.role != "admin": raise HTTPException(403, "Only an admin can do this")
+def require_landlord(s: StaffUser = Depends(current_staff)) -> StaffUser:
+    """Routes that handle money, reports, billing rules, payment settings and staff accounts."""
+    if s.role != "landlord": raise HTTPException(403, "Only the landlord can do this")
     return s
 
 
-def current_tenancy(authorization: str = Header(""), db=Depends(get_db)) -> Tenancy:
+def current_tenancy(authorization: str = Header(""), db=Depends(get_db)):
     data = read_token(authorization, "resident")
     u = db.get(UserAccount, int(data["sub"]))
     if not u or u.token_version != data.get("ver"):
@@ -99,4 +104,5 @@ def current_tenancy(authorization: str = Header(""), db=Depends(get_db)) -> Tena
     t = db.scalar(select(Tenancy).where(Tenancy.resident_id == u.id, Tenancy.end_date.is_(None)))
     if not t: raise HTTPException(403, "No active tenancy")
     db.info["actor"] = f"resident #{u.id}"
+    db.info["org"] = u.org_id
     return t
